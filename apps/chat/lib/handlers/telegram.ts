@@ -3,10 +3,8 @@ import { Actions, Button, Card, CardText, LinkButton } from "chat";
 import {
   cancelBooking,
   createBookingPublic,
-  getAvailableSlots,
   getAvailableSlotsPublic,
   getBookings,
-  getEventTypes,
   getEventTypesByUsername,
   getSchedules,
   rescheduleBooking,
@@ -220,9 +218,9 @@ export async function handleTelegramCommand(
         const auth = await requireAuth();
         if (!auth) return;
         const slug = rest || undefined;
-        const eventTypes = await getEventTypes(auth.accessToken);
+        const eventTypes = await getEventTypesByUsername(auth.linked.calcomUsername);
         if (eventTypes.length === 0) {
-          await thread.post("You have no event types. Create one at https://app.cal.com first.");
+          await thread.post("You have no event types. Create one at [app.cal.com](https://app.cal.com).");
           return;
         }
         const eventType = slug
@@ -230,8 +228,9 @@ export async function handleTelegramCommand(
           : eventTypes[0];
         const now = new Date();
         const weekLater = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-        const slotsMap = await getAvailableSlots(auth.accessToken, {
-          eventTypeId: eventType.id,
+        const slotsMap = await getAvailableSlotsPublic({
+          eventTypeSlug: eventType.slug,
+          username: auth.linked.calcomUsername,
           start: now.toISOString(),
           end: weekLater.toISOString(),
           timeZone: auth.linked.calcomTimeZone,
@@ -266,15 +265,15 @@ export async function handleTelegramCommand(
       if (cmd === "eventtypes") {
         const auth = await requireAuth();
         if (!auth) return;
-        const eventTypes = await getEventTypes(auth.accessToken);
+        const eventTypes = await getEventTypesByUsername(auth.linked.calcomUsername);
         const card = eventTypesListCard(
           eventTypes.map((et) => ({
             title: et.title,
             slug: et.slug,
             length: et.length,
             hidden: et.hidden,
-          })),
-          auth.linked.calcomUsername
+            bookingUrl: et.bookingUrl,
+          }))
         );
         await postPrivately(thread, message, card, isGroup);
         return;
@@ -394,6 +393,7 @@ export async function handleTelegramCommand(
             bookings.map((b) => ({
               uid: b.uid, title: b.title, start: b.start, end: b.end,
               eventTypeId: b.eventType?.id ?? 0,
+              eventTypeSlug: b.eventType?.slug ?? "",
             }))
           ),
           bookingTitle: "",
@@ -762,7 +762,7 @@ export function registerTelegramHandlers(bot: Chat, deps: RegisterTelegramHandle
             await thread.post("Reschedule session expired. Please start again with /reschedule.");
             return;
           }
-          let bookings: Array<{ uid: string; title: string; start: string; end: string; eventTypeId: number }>;
+          let bookings: Array<{ uid: string; title: string; start: string; end: string; eventTypeId: number; eventTypeSlug?: string }>;
           try {
             bookings = JSON.parse(flow.bookingUid);
           } catch {
@@ -776,14 +776,45 @@ export function registerTelegramHandlers(bot: Chat, deps: RegisterTelegramHandle
           }
           const auth = await requireAuthForAction(thread, ctx.teamId, ctx.userId);
           if (!auth) return;
-          const { accessToken, linked } = auth;
+          const { linked } = auth;
+          const eventTypeSlug = selected.eventTypeSlug;
+          if (!eventTypeSlug) {
+            await thread.post("Cannot reschedule: event type information is missing for this booking.");
+            await clearRescheduleFlow(ctx.teamId, ctx.userId);
+            return;
+          }
+
+          const fullBookings = await getBookings(
+            auth.accessToken,
+            { status: "upcoming", take: 100 },
+            { id: linked.calcomUserId, email: linked.calcomEmail }
+          );
+          const fullBooking = fullBookings.find((b) => b.uid === selected.uid);
+          const emailLower = linked.calcomEmail.toLowerCase();
+          const isHost =
+            !fullBooking ||
+            fullBooking.hosts?.some(
+              (h) => h.id === linked.calcomUserId || h.email?.toLowerCase() === emailLower
+            ) ||
+            fullBooking.organizer?.email?.toLowerCase() === emailLower ||
+            fullBooking.organizer?.id === linked.calcomUserId;
+          if (!isHost) {
+            await thread.post(
+              "You're an attendee on this booking, not the host. Rescheduling as an attendee isn't supported here — please use the reschedule link in your booking confirmation email or reschedule at [app.cal.com/bookings](https://app.cal.com/bookings)."
+            );
+            await clearRescheduleFlow(ctx.teamId, ctx.userId);
+            return;
+          }
+
           const now = new Date();
           const weekLater = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-          const slotsMap = await getAvailableSlots(accessToken, {
-            eventTypeId: selected.eventTypeId,
+          const slotsMap = await getAvailableSlotsPublic({
+            eventTypeSlug,
+            username: linked.calcomUsername,
             start: now.toISOString(),
             end: weekLater.toISOString(),
             timeZone: linked.calcomTimeZone,
+            bookingUidToReschedule: selected.uid,
           });
           const allSlots = Object.values(slotsMap)
             .flat()
